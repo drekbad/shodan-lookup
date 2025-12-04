@@ -9,9 +9,8 @@ from shodan.exception import APIError
 
 # --- Configuration ---
 # Hardcoded API Key (Will be used IF no API key is provided via command line)
-# Note: Use a secured method (like environment variables) for production secrets.
 # shodan_hardcoded_key = "YOUR_HARDCODED_API_KEY_HERE" 
-shodan_hardcoded_key = "" # Leave blank or comment out if you prefer no hardcoded key
+shodan_hardcoded_key = "" 
 
 # Rate limiting delay (seconds) to prevent hitting API limits
 SLEEP_TIME = 0.5 
@@ -19,32 +18,79 @@ SLEEP_TIME = 0.5
 def expand_ips(input_list):
     """
     Expands a mixed list of individual IPs and CIDR ranges into a unique set
-    of individual IP addresses (including network and broadcast addresses).
+    of public individual IP addresses (excluding RFC 1918 and other private IPs).
     """
-    print("🚀 Expanding IP ranges...")
-    target_ips = set()
+    print("🚀 Starting IP list processing...")
+    
+    # Trackers for the reporting
+    total_original_lines = len(input_list)
+    private_lines_found = set()  # Store original line entries that contain private IPs/CIDRs
+    total_expanded_private_ips = 0
+    total_expanded_ips = 0
+    
+    # Set to hold the final unique public IPs for scanning
+    target_public_ips = set()
+
     for entry in input_list:
         entry = entry.strip()
         if not entry:
             continue
             
         try:
-            # Tries to parse as a network (CIDR). strict=False allows host IPs to be used.
+            # First, try to parse it as a network/CIDR (e.g., 192.168.1.0/24)
             network = ipaddress.ip_network(entry, strict=False)
-            # Iterates over all addresses in the network
-            for ip in network:
-                target_ips.add(ip.compressed)
+            
+            # Use the .is_private property on the network object itself
+            if network.is_private:
+                private_lines_found.add(entry)
+                total_expanded_private_ips += network.num_addresses
+                total_expanded_ips += network.num_addresses
+            else:
+                # If it's a public network, iterate and add all IPs to the public set
+                for ip in network:
+                    target_public_ips.add(ip.compressed)
+                    total_expanded_ips += 1
+
         except ValueError:
-            # If not a valid network, assume it's an individual IP address
+            # If it failed as a network, try to parse it as an individual IP
             try:
-                ipaddress.ip_address(entry)
-                target_ips.add(entry)
+                ip_addr = ipaddress.ip_address(entry)
+                total_expanded_ips += 1
+                
+                if ip_addr.is_private:
+                    private_lines_found.add(entry)
+                    total_expanded_private_ips += 1
+                else:
+                    target_public_ips.add(ip_addr.compressed)
+                    
             except ValueError:
                 print(f"⚠️ Skipping invalid entry: {entry}")
-    
-    print(f"✅ Total unique IPs to check: {len(target_ips)}")
-    return target_ips
 
+    # --- Reporting ---
+    
+    # Dump Private IP entries to file
+    private_list_filename = "private_ips_original_entries.txt"
+    if private_lines_found:
+        with open(private_list_filename, 'w') as f:
+            f.write('\n'.join(sorted(list(private_lines_found))) + '\n')
+        print(f"\n📢 Found Private IPs/CIDRs in {len(private_lines_found)} original line item(s).")
+        print(f"   (Written to {private_list_filename})")
+    else:
+        print("\n📢 No private IPs or CIDR ranges found in the input list.")
+
+    
+    print("\n--- Summary of IP Processing ---")
+    print(f"1. Total initial lines read: {total_original_lines}")
+    print(f"2. Total theoretical expanded IPs: {total_expanded_ips}")
+    print(f"3. Total expanded private IPs (Excluded): {total_expanded_private_ips}")
+    print(f"4. Total unique IPs to check (Public): {len(target_public_ips)}")
+    
+    return target_public_ips
+
+
+# --- (The rest of the script remains the same) ---
+# The 'get_shodan_data' and 'main' functions are unchanged, 
+# as they accept the filtered list of public IPs from 'expand_ips'.
 def get_shodan_data(ip_list, api_key, output_prefix="shodan_report"):
     """
     Looks up Shodan data for each IP and saves results to a full JSON file
@@ -74,10 +120,9 @@ def get_shodan_data(ip_list, api_key, output_prefix="shodan_report"):
         csv_writer.writerow(csv_headers)
         
         for i, ip in enumerate(ip_list):
-            print(f"🔎 [{i+1}/{len(ip_list)}] Looking up: {ip}...", end='\r') # Print on the same line
+            print(f"🔎 [{i+1}/{len(ip_list)}] Looking up: {ip}...", end='\r') 
             
             try:
-                # The api.host() call retrieves all host data
                 host_info = api.host(ip)
                 successful_lookups += 1
 
@@ -85,16 +130,11 @@ def get_shodan_data(ip_list, api_key, output_prefix="shodan_report"):
                 json_file.write(json.dumps(host_info) + '\n')
                 
                 # --- B. Concise CSV Summary ---
-                
-                # Extract FQDNs
                 hostnames = "; ".join(host_info.get('hostnames', []))
                 
-                # Format Ports & Services (Port:Service/Product)
                 ports_services = []
-                # Iterate through the 'data' array, which contains service banners
                 for service in host_info.get('data', []):
                     port = service.get('port')
-                    # Use the 'product' field (e.g., Apache, nginx) or 'transport' if product is missing
                     product = service.get('product') or service.get('transport', 'unknown')
                     ports_services.append(f"{port}:{product}")
                 
@@ -110,31 +150,26 @@ def get_shodan_data(ip_list, api_key, output_prefix="shodan_report"):
                 csv_writer.writerow(csv_row)
                 
             except APIError as e:
-                # Handle common Shodan API errors (e.g., No information found)
                 if "No information available for that IP" in str(e):
-                    # Clear the line before printing the status
                     sys.stdout.write(' ' * 80 + '\r')
                     print(f"   [--] {ip}: No Shodan data found.")
                 else:
                     sys.stdout.write(' ' * 80 + '\r')
                     print(f"   [--] API Error for {ip}: {e}")
             
-            # Pause to respect rate limits
             time.sleep(SLEEP_TIME) 
             
-    # Clear the last line and print summary
     sys.stdout.write(' ' * 80 + '\r')
-    print("\n\n--- RESULTS ---")
+    print("\n\n--- FINAL RESULTS ---")
     print(f"✅ Completed lookups for {successful_lookups} hosts with data.")
     print(f"   - Full JSON Dump (JSON Lines): {json_filename}")
     print(f"   - Concise CSV Summary: {csv_filename}")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Expand IP/CIDR list and query Shodan API for host information."
+        description="Expand IP/CIDR list, filter private IPs, and query Shodan API for host information."
     )
     
-    # Optional API Key argument
     parser.add_argument(
         '-k', '--key', 
         type=str, 
@@ -142,7 +177,6 @@ def main():
         default=None
     )
     
-    # Required Input File argument
     parser.add_argument(
         'ip_file', 
         type=str, 
@@ -168,11 +202,15 @@ def main():
         print(f"❌ Error: Input file not found at {args.ip_file}")
         sys.exit(1)
 
-    # 3. Expand the list
-    expanded_ips = expand_ips(ip_cidr_list)
+    # 3. Filter and Expand the list (now removes private IPs)
+    expanded_public_ips = expand_ips(ip_cidr_list)
     
+    if not expanded_public_ips:
+        print("\n🛑 No public IP addresses remaining after filtering. Exiting.")
+        sys.exit(0)
+        
     # 4. Get Shodan data and write files
-    get_shodan_data(expanded_ips, shodan_api_key)
+    get_shodan_data(expanded_public_ips, shodan_api_key)
 
 if __name__ == "__main__":
     main()
